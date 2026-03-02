@@ -25,7 +25,7 @@ For a detailed list of all improvements, see [IMPROVEMENTS_SUMMARY.md](IMPROVEME
 - 4 new performance tracking metrics
 
 
-Added Manual Buy. 3.1.26
+Added Manual Buy to the gui. you have the choice to Auto train or manually train the added coin. 3.1.26
 
 ---
 
