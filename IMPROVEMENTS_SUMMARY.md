@@ -2,7 +2,7 @@
 
 **Forked from:** [garagesteve1155/PowerTrader_AI](https://github.com/garagesteve1155/PowerTrader_AI)  
 **Fork Maintainer:** Jim  
-**Version:** 1.00 (as of February 27, 2026)  
+**Version:** 1.00 (as of March 1, 2026)  
 **Primary Focus:** Small account optimization and enhanced risk management
 
 ---
@@ -196,6 +196,60 @@ def get_account_value(self) -> float:
 
 ---
 
+### 8. **Manual Buy Panel** *(pt_hub.py)*
+
+**Original Behavior:**
+- No way to place a one-off buy from the Hub UI
+- Purchasing a new coin required manually using Robinhood before adding it to settings
+- New coins had to be added to `gui_settings.json` by hand
+
+**New Feature:** Manual Buy panel in the Controls / Health tab
+
+**GUI Elements:**
+```
+[ Coin: _______  ] [ Amount $: ________ ] [ Buy Now ]
+[ ] Auto-train after buy      Status: Ready
+```
+
+**How It Works:**
+
+A dedicated `_RobinhoodDirectClient` class was added to `pt_hub.py`. This is a lightweight, self-contained Robinhood crypto API client that reads credentials from the same `r_key.txt` / `r_secret.txt` files used by `pt_trader.py`, allowing the Hub to place market buys independently — without requiring the trader subprocess to be running.
+
+**Workflow on "Buy Now" click:**
+1. Validates coin symbol (non-empty, uppercased automatically)
+2. Validates dollar amount (numeric, greater than $0, strips `$` and `,` automatically)
+3. Disables the Buy Now button and updates the status label to prevent duplicate orders
+4. Spawns a background daemon thread so the UI stays responsive during the API call
+5. Places a market buy order via the Robinhood crypto API
+6. On success:
+   - Adds the coin to `gui_settings.json` if not already present (atomic write via `.tmp` → `os.replace`)
+   - Creates the coin's neural subfolder (e.g., `DOGE\`) if it does not exist
+   - Copies `pt_trainer.py` into the new subfolder so the coin is ready to train
+   - Refreshes the Hub's coin list and settings in-memory
+   - If **Auto-train after buy** is checked, automatically triggers training for the new coin
+7. Re-enables the Buy Now button and updates status with success or error message
+
+**Input Validation:**
+- Empty coin symbol → `"Error: Enter a coin symbol (e.g. DOGE)."`
+- Non-numeric amount → `"Error: Amount must be a number (e.g. 25.00)."`
+- Amount ≤ $0 → `"Error: Amount must be greater than $0."`
+- Missing credentials → descriptive error directing user to API Setup Wizard
+- API order failure → error message from Robinhood response displayed in status label
+
+**Key Design Decisions:**
+- `_RobinhoodDirectClient` is entirely self-contained in `pt_hub.py` — no modifications to `pt_trader.py` required
+- Uses the same authentication and request-signing logic as `pt_trader.py` for consistency
+- All UI updates are posted back to the main thread via `self.after()` — thread-safe
+- Atomic settings file write prevents corruption if the process is interrupted mid-save
+- Non-fatal: neural folder creation failure logs a warning but does not abort the buy
+
+**Dependencies:**
+- `requests` — HTTP calls to Robinhood API (already required by `pt_trader.py`)
+- `pynacl` — request signing (already required by `pt_trader.py`)
+- Both packages are in `requirements.txt` and installed during standard setup
+
+---
+
 ## Critical Bug Fixes
 
 ### Bug #1: Unicode Emoji Crash (Windows)
@@ -301,6 +355,7 @@ setting = config.get('key', safe_default_value)  # Never crashes
 **Added comprehensive try-except blocks:**
 - Around all new methods (`_apply_account_tier_settings`, `_check_hard_stop_loss`, `_check_position_limits`)
 - Around GUI metric calculations in `pt_hub.py`
+- Around Manual Buy background thread execution
 - Graceful degradation - missing features don't crash the bot
 - Falls back to safe defaults on any exception
 
@@ -336,6 +391,7 @@ setting = config.get('key', safe_default_value)  # Never crashes
 - ✅ Reserve minimum enforced (20% stays liquid)
 - ✅ Maximum 3 concurrent positions enforced
 - ✅ All new GUI metrics displaying correctly
+- ✅ Manual Buy panel placing live orders successfully
 
 ---
 
@@ -354,6 +410,7 @@ setting = config.get('key', safe_default_value)  # Never crashes
 3. **Tiered profit testing** - Confirmed staged exits at +7% and +15%
 4. **Reserve enforcement** - Validated 20% minimum cash retention
 5. **Account value tracking** - Confirmed accurate total value calculation
+6. **Manual Buy testing** - Confirmed live order placement, settings update, and folder creation
 
 ---
 
@@ -412,6 +469,7 @@ The following improvements were identified but not yet built (listed in suggeste
 - **3-tier profit system** vs single all-or-nothing exit
 - **4 new performance metrics** for strategy evaluation
 - **3 critical bugs** fixed (Unicode crash, NameError, instance variable)
+- **1 Manual Buy panel** for on-demand order placement from the Hub UI
 - **100% backward compatibility** maintained
 
 ### Qualitative Gains
@@ -421,6 +479,7 @@ The following improvements were identified but not yet built (listed in suggeste
 - More predictable P&L outcomes
 - Better capital preservation on drawdowns
 - Optimized for small account compounding
+- Ability to manually enter positions and add new coins without leaving the Hub
 
 ---
 
@@ -463,6 +522,6 @@ This software places real trades automatically. You are responsible for everythi
 
 ---
 
-*Last Updated: February 27, 2026*  
+*Last Updated: March 1, 2026*  
 *Fork Version: 1.00*  
-*Document Version: 1.0*
+*Document Version: 1.1*
