@@ -1,10 +1,12 @@
 import base64
+import csv
 import datetime
 import json
 import uuid
 import time
 import math
-from typing import Any, Dict, Optional
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Any, Dict, List, Optional
 import requests
 from nacl.signing import SigningKey
 import os
@@ -24,6 +26,7 @@ TRADER_STATUS_PATH = os.path.join(HUB_DATA_DIR, "trader_status.json")
 TRADE_HISTORY_PATH = os.path.join(HUB_DATA_DIR, "trade_history.jsonl")
 PNL_LEDGER_PATH = os.path.join(HUB_DATA_DIR, "pnl_ledger.json")
 ACCOUNT_VALUE_HISTORY_PATH = os.path.join(HUB_DATA_DIR, "account_value_history.jsonl")
+FORM_8949_CSV_PATH = os.path.join(HUB_DATA_DIR, "form_8949_trades.csv")
 
 
 
@@ -101,7 +104,7 @@ def _load_gui_settings() -> dict:
 			trade_start_level = int(float(trade_start_level))
 		except Exception:
 			trade_start_level = int(_gui_settings_cache.get("trade_start_level", 3))
-		trade_start_level = max(1, min(trade_start_level, 7))
+		trade_start_level = max(1, min(trade_start_level, 9))
 
 		start_allocation_pct = data.get("start_allocation_pct", _gui_settings_cache.get("start_allocation_pct", 0.005))
 		try:
@@ -294,7 +297,7 @@ def _refresh_paths_and_symbols():
 
 	coins = s.get("coins") or list(crypto_symbols)
 	mndir = s.get("main_neural_dir") or main_dir
-	TRADE_START_LEVEL = max(1, min(int(s.get("trade_start_level", TRADE_START_LEVEL) or TRADE_START_LEVEL), 7))
+	TRADE_START_LEVEL = max(1, min(int(s.get("trade_start_level", TRADE_START_LEVEL) or TRADE_START_LEVEL), 9))
 	START_ALLOC_PCT = float(s.get("start_allocation_pct", START_ALLOC_PCT) or START_ALLOC_PCT)
 	if START_ALLOC_PCT < 0.0:
 		START_ALLOC_PCT = 0.0
@@ -503,9 +506,11 @@ class CryptoAPITrading:
                 self.profit_tier1_fraction = float(settings.get("profit_tier1_fraction", 0.33))
                 self.profit_tier2_pct      = float(settings.get("profit_tier2_pct", 0.0))
                 self.profit_tier2_fraction = float(settings.get("profit_tier2_fraction", 0.50))
+                self._small_account_active = False
                 return
             
             # Apply small account overrides
+            self._small_account_active = True
             print(f"[SMALL ACCOUNT MODE] Account: ${account_value:,.2f} - Using small account optimizations")
             
             small = settings.get("small_account_settings", {})
@@ -589,6 +594,7 @@ class CryptoAPITrading:
             self.profit_tier1_fraction = 0.33
             self.profit_tier2_pct      = 0.0
             self.profit_tier2_fraction = 0.50
+            self._small_account_active = False
 
 
 
@@ -731,6 +737,105 @@ class CryptoAPITrading:
         except Exception:
             return 0.0, None
 
+    def _extract_amounts_and_fees_from_order(self, order: dict) -> tuple:
+        """
+        Returns (filled_qty, avg_price, notional_usd, fees_usd) using Decimal math
+        for cent-accurate P&L tracking. Prefers order-level filled fields for USD
+        notional (matches Robinhood's accounting) and falls back to execution sums
+        only when those fields are missing.
+        """
+        try:
+            def _fee_to_float(v: Any) -> float:
+                try:
+                    if v is None:
+                        return 0.0
+                    if isinstance(v, (int, float)):
+                        return float(v)
+                    if isinstance(v, str):
+                        return float(v)
+                    if isinstance(v, dict):
+                        for k in ("amount", "value", "usd_amount", "fee", "quantity"):
+                            if k in v:
+                                try:
+                                    return float(v[k])
+                                except Exception:
+                                    continue
+                    if isinstance(v, (list, tuple)):
+                        return float(sum(_fee_to_float(x) for x in v))
+                    return 0.0
+                except Exception:
+                    return 0.0
+
+            def _to_decimal(x: Any) -> Decimal:
+                try:
+                    if x is None:
+                        return Decimal("0")
+                    return Decimal(str(x))
+                except Exception:
+                    return Decimal("0")
+
+            def _usd_cents(d: Decimal) -> Decimal:
+                """Round a Decimal to 2 decimal places (cents)."""
+                return d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+            # --- Fees (sum from executions + order-level) ---
+            fee_total = 0.0
+            execs = order.get("executions", []) or []
+            for ex in execs:
+                try:
+                    for fk in ("fee", "fees", "fee_amount", "fee_usd", "fee_in_usd"):
+                        if fk in ex:
+                            fee_total += _fee_to_float(ex.get(fk))
+                except Exception:
+                    continue
+            for fk in ("fee", "fees", "fee_amount", "fee_usd", "fee_in_usd"):
+                if fk in order:
+                    fee_total += _fee_to_float(order.get(fk))
+
+            # --- Try order-level filled fields first (Robinhood's own accounting) ---
+            avg_p_raw = order.get("average_price", None) or order.get("avg_price", None)
+            filled_q_raw = order.get("filled_asset_quantity", None) or order.get("filled_quantity", None)
+
+            if avg_p_raw is not None and filled_q_raw is not None:
+                avg_p_d = _to_decimal(avg_p_raw)
+                filled_q_d = _to_decimal(filled_q_raw)
+                if filled_q_d > 0 and avg_p_d > 0:
+                    notional_d = _usd_cents(avg_p_d * filled_q_d)
+                    return (
+                        float(filled_q_d),
+                        float(avg_p_d),
+                        float(notional_d),
+                        float(fee_total),
+                    )
+
+            # --- Fallback: sum from executions ---
+            if execs:
+                total_notional_d = Decimal("0")
+                total_qty_d = Decimal("0")
+                for ex in execs:
+                    try:
+                        q = _to_decimal(ex.get("quantity", 0))
+                        p = _to_decimal(ex.get("effective_price", 0))
+                        if q > 0 and p > 0:
+                            total_qty_d += q
+                            total_notional_d += (q * p)
+                    except Exception:
+                        continue
+
+                if total_qty_d > 0 and total_notional_d > 0:
+                    avg_d = _usd_cents(total_notional_d / total_qty_d)
+                    notional_d = _usd_cents(total_notional_d)
+                    return (
+                        float(total_qty_d),
+                        float(avg_d),
+                        float(notional_d),
+                        float(fee_total),
+                    )
+
+            return 0.0, None, 0.0, float(fee_total)
+        except Exception:
+            return 0.0, None, 0.0, 0.0
+
     def _wait_for_order_terminal(self, symbol: str, order_id: str) -> Optional[dict]:
         """Blocks until order is filled/canceled/rejected, then returns the order dict."""
         terminal = {"filled", "canceled", "cancelled", "rejected", "failed", "error"}
@@ -793,7 +898,7 @@ class CryptoAPITrading:
                             progressed = True
                             continue
 
-                        filled_qty, avg_price = self._extract_fill_from_order(order)
+                        filled_qty, avg_price, notional_usd, fees_usd_val = self._extract_amounts_and_fees_from_order(order)
                         bp_after = self._get_buying_power()
                         bp_delta = float(bp_after) - float(bp_before)
 
@@ -806,7 +911,7 @@ class CryptoAPITrading:
                             pnl_pct=info.get("pnl_pct", None),
                             tag=info.get("tag", None),
                             order_id=order_id,
-                            fees_usd=None,
+                            fees_usd=float(fees_usd_val) if fees_usd_val else None,
                             buying_power_before=bp_before,
                             buying_power_after=bp_after,
                             buying_power_delta=bp_delta,
@@ -1018,7 +1123,7 @@ class CryptoAPITrading:
 
         Used for:
         - Start gate: start trades at level 3+
-        - DCA assist: levels 4-7 map to trader DCA stages 0-3 (trade starts at level 3 => stage 0)
+        - DCA assist: levels 4-9 map to trader DCA stages 0-5 (trade starts at level 3 => stage 0)
         """
         sym = str(symbol).upper().strip()
         folder = base_paths.get(sym, main_dir if sym == "BTC" else os.path.join(main_dir, sym))
@@ -1039,7 +1144,7 @@ class CryptoAPITrading:
 
         Used for:
         - Start gate: start trades at level 3+
-        - DCA assist: levels 4-7 map to trader DCA stages 0-3 (trade starts at level 3 => stage 0)
+        - DCA assist: levels 4-9 map to trader DCA stages 0-5 (trade starts at level 3 => stage 0)
         """
         sym = str(symbol).upper().strip()
         folder = base_paths.get(sym, main_dir if sym == "BTC" else os.path.join(main_dir, sym))
@@ -1060,7 +1165,7 @@ class CryptoAPITrading:
         Returned ordering is highest->lowest so:
           N1 = 1st blue line (top)
           ...
-          N7 = 7th blue line (bottom)
+          N9 = 9th blue line (bottom)
         """
         sym = str(symbol).upper().strip()
         folder = base_paths.get(sym, main_dir if sym == "BTC" else os.path.join(main_dir, sym))
@@ -1084,7 +1189,7 @@ class CryptoAPITrading:
                 except Exception:
                     continue
 
-            # De-dupe, then sort high->low for stable N1..N7 mapping
+            # De-dupe, then sort high->low for stable N1..N9 mapping
             out = []
             seen = set()
             for v in vals:
@@ -1341,9 +1446,61 @@ class CryptoAPITrading:
 
         return trading_pairs
 
-    def get_orders(self, symbol: str) -> Any:
+    def get_orders(self, symbol: str, max_pages: int = 25) -> Any:
+        """Fetch crypto orders for a symbol, following pagination so older bot buys
+        (which may be on earlier pages) are included.
+
+        Robinhood's orders endpoint is paginated. If we only read the first page,
+        a newer manual SELL can push earlier bot BUYs off page 1, which then breaks
+        cost-basis reconstruction. This method returns a single dict with an
+        aggregated "results" list.
+        """
         path = f"/api/v1/crypto/trading/orders/?symbol={symbol}"
-        return self.make_api_request("GET", path)
+        first = self.make_api_request("GET", path)
+
+        # If the API didn't return the expected shape, keep legacy behavior.
+        if not isinstance(first, dict):
+            return first
+
+        results = list(first.get("results", []) or [])
+        next_url = first.get("next", None)
+
+        # Follow pagination links (best-effort, capped).
+        pages = 1
+        while next_url and pages < int(max_pages):
+            try:
+                nxt = str(next_url).strip()
+                if not nxt:
+                    break
+
+                # Convert absolute URL -> relative path expected by make_api_request().
+                if nxt.startswith(self.base_url):
+                    nxt_path = nxt[len(self.base_url):]
+                elif nxt.startswith("/"):
+                    nxt_path = nxt
+                elif "://" in nxt:
+                    # Fallback: strip scheme+host
+                    try:
+                        nxt_path = "/" + nxt.split("://", 1)[1].split("/", 1)[1]
+                    except Exception:
+                        break
+                else:
+                    nxt_path = "/" + nxt
+
+                resp = self.make_api_request("GET", nxt_path)
+                if not isinstance(resp, dict):
+                    break
+
+                results.extend(list(resp.get("results", []) or []))
+                next_url = resp.get("next", None)
+                pages += 1
+            except Exception:
+                break
+
+        out = dict(first)
+        out["results"] = results
+        out["next"] = None
+        return out
 
     def calculate_cost_basis(self):
         holdings = self.get_holdings()
@@ -1519,7 +1676,7 @@ class CryptoAPITrading:
                                 pass
                             return None
 
-                        filled_qty, avg_fill_price = self._extract_fill_from_order(order)
+                        filled_qty, avg_fill_price, notional_usd, fees_usd_val = self._extract_amounts_and_fees_from_order(order)
 
                         buying_power_after = self._get_buying_power()
                         buying_power_delta = float(buying_power_after) - float(buying_power_before)
@@ -1534,6 +1691,7 @@ class CryptoAPITrading:
                             pnl_pct=float(pnl_pct) if pnl_pct is not None else None,
                             tag=tag,
                             order_id=order_id,
+                            fees_usd=float(fees_usd_val) if fees_usd_val else None,
                             buying_power_before=buying_power_before,
                             buying_power_after=buying_power_after,
                             buying_power_delta=buying_power_delta,
@@ -1623,26 +1781,6 @@ class CryptoAPITrading:
             actual_qty = float(asset_quantity)
             fees_usd = None
 
-            def _fee_to_float(v: Any) -> float:
-                try:
-                    if v is None:
-                        return 0.0
-                    if isinstance(v, (int, float)):
-                        return float(v)
-                    if isinstance(v, str):
-                        return float(v)
-                    if isinstance(v, dict):
-                        # common shapes: {"amount": "0.12"}, {"value": 0.12}, etc.
-                        for k in ("amount", "value", "usd_amount", "fee", "quantity"):
-                            if k in v:
-                                try:
-                                    return float(v[k])
-                                except Exception:
-                                    continue
-                    return 0.0
-                except Exception:
-                    return 0.0
-
             try:
                 if order_id:
                     match = self._wait_for_order_terminal(symbol, order_id)
@@ -1658,33 +1796,12 @@ class CryptoAPITrading:
                             pass
                         return response
 
-                    execs = match.get("executions", []) or []
-                    total_qty = 0.0
-                    total_notional = 0.0
-                    fee_total = 0.0
+                    # Use Decimal-precision extraction for accurate P&L
+                    filled_qty, avg_fill, notional_usd, fee_total = self._extract_amounts_and_fees_from_order(match)
 
-                    for ex in execs:
-                        try:
-                            q = float(ex.get("quantity", 0.0) or 0.0)
-                            p = float(ex.get("effective_price", 0.0) or 0.0)
-                            total_qty += q
-                            total_notional += (q * p)
-
-                            # Fees can show up under different keys; handle the common ones.
-                            for fk in ("fee", "fees", "fee_amount", "fee_usd", "fee_in_usd"):
-                                if fk in ex:
-                                    fee_total += _fee_to_float(ex.get(fk))
-                        except Exception:
-                            continue
-
-                    # Some payloads include order-level fee fields too
-                    for fk in ("fee", "fees", "fee_amount", "fee_usd", "fee_in_usd"):
-                        if fk in match:
-                            fee_total += _fee_to_float(match.get(fk))
-
-                    if total_qty > 0.0 and total_notional > 0.0:
-                        actual_qty = total_qty
-                        actual_price = total_notional / total_qty
+                    if filled_qty > 0.0 and avg_fill is not None:
+                        actual_qty = filled_qty
+                        actual_price = avg_fill
 
                     fees_usd = float(fee_total) if fee_total else 0.0
 
@@ -1749,14 +1866,14 @@ class CryptoAPITrading:
         hard_stop = getattr(self, 'hard_stop_pct', -35.0)
         
         if gain_loss_pct <= hard_stop:
-            # One-time neural override: if network is screaming L7, allow one more chance
+            # One-time neural override: if network is nearly unanimous BUY, allow one more chance
             neural_level = self._read_long_dca_signal(symbol)
             override_key = f"{symbol}_stop_override"
             
             if not hasattr(self, '_stop_overrides'):
                 self._stop_overrides = {}
             
-            if neural_level >= 7 and not self._stop_overrides.get(override_key, False):
+            if neural_level >= 8 and not self._stop_overrides.get(override_key, False):
                 print(
                     f"  [WARNING] HARD STOP at {gain_loss_pct:.1f}% BUT neural L{neural_level} "
                     f"is screaming BUY. Allowing ONE more chance to recover."
@@ -1842,21 +1959,32 @@ class CryptoAPITrading:
             self.max_dca_buys_per_24h = int(MAX_DCA_BUYS_PER_24H)
 
             # Trailing PM settings (hot-reload)
+            # Small account mode sets its own pm/trail values at startup via
+            # _apply_account_tier_settings(). Those must NOT be overwritten here
+            # by the GUI-level globals — doing so was causing the SELL line and
+            # trailing stop to operate at the wrong (GUI-level) values.
             old_sig = getattr(self, "_last_trailing_settings_sig", None)
 
-            new_gap = float(TRAILING_GAP_PCT)
-            new_pm0 = float(PM_START_PCT_NO_DCA)
-            new_pm1 = float(PM_START_PCT_WITH_DCA)
+            if not getattr(self, '_small_account_active', False):
+                # Standard mode: allow GUI-level hot-reload to update PM settings.
+                new_gap = float(TRAILING_GAP_PCT)
+                new_pm0 = float(PM_START_PCT_NO_DCA)
+                new_pm1 = float(PM_START_PCT_WITH_DCA)
+                self.trailing_gap_pct = new_gap
+                self.pm_start_pct_no_dca = new_pm0
+                self.pm_start_pct_with_dca = new_pm1
 
-            self.trailing_gap_pct = new_gap
-            self.pm_start_pct_no_dca = new_pm0
-            self.pm_start_pct_with_dca = new_pm1
+            # Build sig from the current instance values (whether just updated or
+            # already set by small account mode) so the state-reset comparison is
+            # always based on what the bot is actually using.
+            new_sig = (
+                float(self.trailing_gap_pct),
+                float(self.pm_start_pct_no_dca),
+                float(self.pm_start_pct_with_dca),
+            )
 
-            new_sig = (float(new_gap), float(new_pm0), float(new_pm1))
-
-            # If trailing settings changed, reset ALL trailing PM state so:
-            # - the line updates immediately
-            # - peak/armed/was_above are cleared
+            # If trailing settings genuinely changed, reset per-coin trailing state
+            # so the line and peak update immediately with the new values.
             if (old_sig is not None) and (new_sig != old_sig):
                 self.trailing_pm = {}
 
@@ -2009,9 +2137,9 @@ class CryptoAPITrading:
             hard_next = self.dca_levels[next_stage] if next_stage < len(self.dca_levels) else self.dca_levels[-1]
 
             # Neural DCA applies to the levels BELOW the trade-start level.
-            # Example: trade_start_level=3 => stages 0..3 map to N4..N7 (4 total).
-            start_level = max(1, min(int(TRADE_START_LEVEL or 3), 7))
-            neural_dca_max = max(0, 7 - start_level)
+            # Example: trade_start_level=3 => stages 0..5 map to N4..N9 (6 total).
+            start_level = max(1, min(int(TRADE_START_LEVEL or 3), 9))
+            neural_dca_max = max(0, 9 - start_level)
 
             if next_stage < neural_dca_max:
                 neural_next = start_level + 1 + next_stage
@@ -2021,7 +2149,7 @@ class CryptoAPITrading:
 
             # --- DCA DISPLAY LINE (show whichever trigger will be hit first: higher of NEURAL line vs HARD line) ---
             # Hardcoded gives an actual price line: cost_basis * (1 + hard_next%).
-            # Neural gives an actual price line from low_bound_prices.html (N1..N7).
+            # Neural gives an actual price line from low_bound_prices.html (N1..N9).
             dca_line_source = "HARD"
             dca_line_price = 0.0
             dca_line_pct = 0.0
@@ -2035,7 +2163,7 @@ class CryptoAPITrading:
 
                 if next_stage < neural_dca_max:
                     neural_level_needed_disp = start_level + 1 + next_stage
-                    neural_levels = self._read_long_price_levels(symbol)  # highest->lowest == N1..N7
+                    neural_levels = self._read_long_price_levels(symbol)  # highest->lowest == N1..N9
 
                     neural_line_price = 0.0
                     if len(neural_levels) >= neural_level_needed_disp:
@@ -2316,24 +2444,28 @@ class CryptoAPITrading:
 
             # DCA (NEURAL or hardcoded %, whichever hits first for the current stage)
             # Trade starts at neural level 3 => trader is at stage 0.
-            # Neural-driven DCA stages (max 4):
+            # Neural-driven DCA stages (max 6 with 9 timeframes):
             #   stage 0 => neural 4 OR -2.5%
             #   stage 1 => neural 5 OR -5.0%
             #   stage 2 => neural 6 OR -10.0%
             #   stage 3 => neural 7 OR -20.0%
-            # After that: hardcoded only (-30, -40, -50, then repeat -50 forever).
+            #   stage 4 => neural 8 OR -30.0%
+            #   stage 5 => neural 9 OR -40.0%
+            # After that: hardcoded only (-50, then repeat -50 forever).
             current_stage = len(self.dca_levels_triggered.get(symbol, []))
 
             # Hardcoded loss % for this stage (repeat last level after list ends)
             hard_level = self.dca_levels[current_stage] if current_stage < len(self.dca_levels) else self.dca_levels[-1]
             hard_hit = gain_loss_percentage_buy <= hard_level
 
-            # Neural trigger only for first 4 DCA stages
+            # Neural trigger for DCA stages (dynamic based on timeframe count)
             neural_level_needed = None
             neural_level_now = None
             neural_hit = False
-            if current_stage < 4:
-                neural_level_needed = current_stage + 4
+            _dca_start_level = max(1, min(int(TRADE_START_LEVEL or 3), 9))
+            _dca_neural_max = max(0, 9 - _dca_start_level)
+            if current_stage < _dca_neural_max:
+                neural_level_needed = _dca_start_level + 1 + current_stage
                 neural_level_now = self._read_long_dca_signal(symbol)
 
                 # Keep it sane: don't DCA from neural if we're not even below cost basis.
@@ -2513,7 +2645,7 @@ class CryptoAPITrading:
             buy_count = self._read_long_dca_signal(base_symbol)
             sell_count = self._read_short_dca_signal(base_symbol)
 
-            start_level = max(1, min(int(TRADE_START_LEVEL or 3), 7))
+            start_level = max(1, min(int(TRADE_START_LEVEL or 3), 9))
 
             # Default behavior: long must be >= start_level and short must be 0
             if not (buy_count >= start_level and sell_count == 0):
@@ -2598,6 +2730,248 @@ class CryptoAPITrading:
             pass
 
 
+    # ------------------------------------------------------------------
+    # IRS Form 8949 CSV Export
+    # ------------------------------------------------------------------
+    def export_8949_csv(self, year: Optional[int] = None, output_path: Optional[str] = None) -> Optional[str]:
+        """
+        Reads trade_history.jsonl and writes a CSV with the columns required by
+        IRS Form 8949:
+
+            (a) Description of property
+            (b) Date acquired
+            (c) Date sold or disposed of
+            (d) Proceeds (sales price)
+            (e) Cost or other basis
+            (f) Code
+            (g) Amount of adjustment
+            (h) Gain or (loss)
+
+        Only SELL trades are tax-reportable dispositions. Each sell is paired with
+        its cost basis from the trade record. The CSV is written to hub_data/ by
+        default and the path is returned.
+
+        Args:
+            year: Tax year to filter (e.g. 2026). None = all trades.
+            output_path: Override output file path. None = hub_data/form_8949_trades.csv
+                         (or form_8949_trades_YYYY.csv when year is specified).
+
+        Returns:
+            The path of the written CSV, or None on error.
+        """
+        try:
+            if not os.path.isfile(TRADE_HISTORY_PATH):
+                print("[8949 EXPORT] No trade history file found.")
+                return None
+
+            # Determine output path
+            if output_path is None:
+                if year is not None:
+                    fname = f"form_8949_trades_{int(year)}.csv"
+                else:
+                    fname = "form_8949_trades.csv"
+                output_path = os.path.join(HUB_DATA_DIR, fname)
+
+            # Read all trades
+            trades: List[dict] = []
+            with open(TRADE_HISTORY_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = (line or "").strip()
+                    if not line:
+                        continue
+                    try:
+                        trades.append(json.loads(line))
+                    except Exception:
+                        continue
+
+            if not trades:
+                print("[8949 EXPORT] Trade history is empty.")
+                return None
+
+            # Build a map of buy-side records keyed by symbol so we can look up
+            # the acquisition date for each sell. For positions built through
+            # multiple DCA buys, we use the EARLIEST buy timestamp as the
+            # acquisition date (matching FIFO / specific-identification intent).
+            # The map resets when a sell fully closes a position.
+            buy_dates: Dict[str, float] = {}   # symbol -> earliest buy ts for current position
+            buy_costs: Dict[str, Decimal] = {} # symbol -> accumulated cost for current position
+            buy_qtys: Dict[str, Decimal] = {}  # symbol -> accumulated qty for current position
+
+            rows_8949: List[dict] = []
+
+            for t in trades:
+                try:
+                    side = str(t.get("side", "")).lower().strip()
+                    symbol_raw = str(t.get("symbol", "")).upper().strip()
+                    base = symbol_raw.split("-")[0].strip()
+                    ts = float(t.get("ts", 0.0) or 0.0)
+
+                    if not base or ts <= 0.0:
+                        continue
+
+                    qty_d = Decimal(str(t.get("qty", 0) or 0))
+                    price_raw = t.get("price", None)
+                    price_d = Decimal(str(price_raw)) if price_raw is not None else Decimal("0")
+                    fees_raw = t.get("fees_usd", None)
+                    fees_d = Decimal(str(fees_raw)) if fees_raw is not None else Decimal("0")
+
+                    if side == "buy":
+                        # Track earliest buy date for current open position
+                        if base not in buy_dates or buy_qtys.get(base, Decimal("0")) <= 0:
+                            buy_dates[base] = ts
+                            buy_costs[base] = Decimal("0")
+                            buy_qtys[base] = Decimal("0")
+
+                        # Use buying_power_delta for exact cost when available
+                        bp_delta = t.get("buying_power_delta", None)
+                        if bp_delta is not None:
+                            cost_this_buy = abs(Decimal(str(bp_delta)))
+                        else:
+                            cost_this_buy = (qty_d * price_d) + fees_d
+
+                        buy_costs[base] = buy_costs.get(base, Decimal("0")) + cost_this_buy
+                        buy_qtys[base] = buy_qtys.get(base, Decimal("0")) + qty_d
+
+                    elif side == "sell":
+                        # Year filter
+                        sell_dt = datetime.datetime.fromtimestamp(ts)
+                        if year is not None and sell_dt.year != int(year):
+                            # Still update position tracking even if we skip the row
+                            sell_frac = Decimal("1")
+                            if buy_qtys.get(base, Decimal("0")) > 0 and qty_d > 0:
+                                sell_frac = min(Decimal("1"), qty_d / buy_qtys[base])
+                            cost_allocated = (buy_costs.get(base, Decimal("0")) * sell_frac).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                            buy_costs[base] = buy_costs.get(base, Decimal("0")) - cost_allocated
+                            buy_qtys[base] = buy_qtys.get(base, Decimal("0")) - qty_d
+                            if buy_qtys.get(base, Decimal("0")) <= Decimal("0.000000001"):
+                                buy_dates.pop(base, None)
+                                buy_costs.pop(base, None)
+                                buy_qtys.pop(base, None)
+                            continue
+
+                        # Calculate proceeds (what you received)
+                        bp_delta_sell = t.get("buying_power_delta", None)
+                        if bp_delta_sell is not None:
+                            proceeds_d = Decimal(str(bp_delta_sell)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                        else:
+                            proceeds_d = ((qty_d * price_d) - fees_d).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+                        # Calculate cost basis (pro-rata from accumulated buys)
+                        sell_frac = Decimal("1")
+                        if buy_qtys.get(base, Decimal("0")) > 0 and qty_d > 0:
+                            sell_frac = min(Decimal("1"), qty_d / buy_qtys[base])
+
+                        cost_basis_d = (buy_costs.get(base, Decimal("0")) * sell_frac).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+                        # Gain or loss
+                        gain_loss_d = (proceeds_d - cost_basis_d).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+                        # Dates
+                        acquired_dt = datetime.datetime.fromtimestamp(buy_dates.get(base, ts))
+                        sold_dt = sell_dt
+
+                        # Description - e.g. "0.00234500 BTC (Robinhood Crypto)"
+                        qty_str = f"{float(qty_d):.8f}".rstrip("0").rstrip(".")
+                        description = f"{qty_str} {base} (Robinhood Crypto)"
+
+                        rows_8949.append({
+                            "description": description,
+                            "date_acquired": acquired_dt.strftime("%m/%d/%Y"),
+                            "date_sold": sold_dt.strftime("%m/%d/%Y"),
+                            "proceeds": f"{float(proceeds_d):.2f}",
+                            "cost_basis": f"{float(cost_basis_d):.2f}",
+                            "code": "",
+                            "adjustment": "",
+                            "gain_loss": f"{float(gain_loss_d):.2f}",
+                            "hold_period": "Short" if (sold_dt - acquired_dt).days <= 365 else "Long",
+                            "symbol": base,
+                            "tag": str(t.get("tag", "") or ""),
+                            "order_id": str(t.get("order_id", "") or ""),
+                        })
+
+                        # Update position tracking
+                        buy_costs[base] = buy_costs.get(base, Decimal("0")) - cost_basis_d
+                        buy_qtys[base] = buy_qtys.get(base, Decimal("0")) - qty_d
+                        if buy_qtys.get(base, Decimal("0")) <= Decimal("0.000000001"):
+                            buy_dates.pop(base, None)
+                            buy_costs.pop(base, None)
+                            buy_qtys.pop(base, None)
+
+                except Exception:
+                    continue
+
+            if not rows_8949:
+                print(f"[8949 EXPORT] No sell trades found{f' for {year}' if year else ''}.")
+                return None
+
+            # Write CSV
+            fieldnames = [
+                "description",
+                "date_acquired",
+                "date_sold",
+                "proceeds",
+                "cost_basis",
+                "code",
+                "adjustment",
+                "gain_loss",
+                "hold_period",
+                "symbol",
+                "tag",
+                "order_id",
+            ]
+
+            with open(output_path, "w", newline="", encoding="utf-8") as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+
+                # Write header row with 8949 column labels
+                writer.writerow({
+                    "description": "(a) Description of property",
+                    "date_acquired": "(b) Date acquired",
+                    "date_sold": "(c) Date sold",
+                    "proceeds": "(d) Proceeds",
+                    "cost_basis": "(e) Cost or other basis",
+                    "code": "(f) Code",
+                    "adjustment": "(g) Adjustment",
+                    "gain_loss": "(h) Gain or (loss)",
+                    "hold_period": "Hold Period",
+                    "symbol": "Symbol",
+                    "tag": "Trade Tag",
+                    "order_id": "Order ID",
+                })
+
+                # Write totals row
+                total_proceeds = sum(Decimal(r["proceeds"]) for r in rows_8949)
+                total_cost = sum(Decimal(r["cost_basis"]) for r in rows_8949)
+                total_gain = sum(Decimal(r["gain_loss"]) for r in rows_8949)
+
+                for row in rows_8949:
+                    writer.writerow(row)
+
+                writer.writerow({})  # blank separator
+                writer.writerow({
+                    "description": "TOTALS",
+                    "date_acquired": "",
+                    "date_sold": "",
+                    "proceeds": f"{float(total_proceeds):.2f}",
+                    "cost_basis": f"{float(total_cost):.2f}",
+                    "code": "",
+                    "adjustment": "",
+                    "gain_loss": f"{float(total_gain):.2f}",
+                    "hold_period": "",
+                    "symbol": "",
+                    "tag": "",
+                    "order_id": "",
+                })
+
+            count = len(rows_8949)
+            year_str = f" for tax year {year}" if year else ""
+            print(f"[8949 EXPORT] Wrote {count} sell transactions{year_str} to: {output_path}")
+            print(f"[8949 EXPORT] Total Proceeds: ${float(total_proceeds):.2f}  |  Total Cost Basis: ${float(total_cost):.2f}  |  Net Gain/Loss: ${float(total_gain):.2f}")
+            return output_path
+
+        except Exception:
+            print(f"[8949 EXPORT] Error exporting CSV: {traceback.format_exc()}")
+            return None
 
 
     def run(self):
